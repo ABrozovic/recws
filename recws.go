@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"log"
+
 	"net/http"
 	"net/url"
 	"sync"
@@ -46,14 +47,14 @@ type RecConn struct {
 	// NonVerbose suppress connecting/reconnecting messages.
 	NonVerbose bool
 
-	isConnected  bool
-	isConnecting bool
-	mu           sync.RWMutex
-	url          string
-	reqHeader    http.Header
-	httpResp     *http.Response
-	dialErr      error
-	dialer       *websocket.Dialer
+	isConnecting     bool
+	isConnectRunning bool
+	mu               sync.RWMutex
+	url              string
+	reqHeader        http.Header
+	httpResp         *http.Response
+	dialErr          error
+	dialer           *websocket.Dialer
 
 	*websocket.Conn
 }
@@ -61,9 +62,7 @@ type RecConn struct {
 // CloseAndReconnect will try to reconnect.
 func (rc *RecConn) CloseAndReconnect() {
 	rc.Close()
-	connected := make(chan<- struct{})
-	defer close(connected)
-	go rc.connect(connected)
+	go rc.connect()
 }
 
 // setIsConnected sets state for isConnected
@@ -71,7 +70,7 @@ func (rc *RecConn) setIsConnected(state bool) {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
 
-	rc.isConnected = state
+	rc.isConnecting = state
 }
 
 func (rc *RecConn) getConn() *websocket.Conn {
@@ -331,24 +330,10 @@ func (rc *RecConn) Dial(urlStr string, reqHeader http.Header) {
 	rc.setDefaultDialer(rc.getTLSClientConfig(), rc.getHandshakeTimeout())
 
 	// Connect
-	connected := make(chan struct{})
-	go rc.connect(connected)
-	defer close(connected)
+	go rc.connect()
 
-	// wait for first attempt, but only up to a point
-	timer := time.NewTimer(rc.getHandshakeTimeout())
-	defer timer.Stop()
-
-	// no default case means this select will block until one of these conditions is met.
-	// this is still guaranteed to complete, since the fallback here is the timer
-	select {
-	// in this case, the dial error is deferred until rc.GetDialError()
-	case <-timer.C:
-		return
-	case <-connected:
-		return
-	}
-
+	// wait on first attempt
+	time.Sleep(rc.getHandshakeTimeout())
 }
 
 // GetURL returns current connection url
@@ -433,10 +418,10 @@ func (rc *RecConn) keepAlive() {
 	}()
 }
 
-func (rc *RecConn) connect(connected chan<- struct{}) {
+func (rc *RecConn) connect() {
 	rc.mu.Lock()
-	canStart := !rc.isConnecting
-	rc.isConnecting = true
+	canStart := !rc.isConnectRunning
+	rc.isConnectRunning = true
 	rc.mu.Unlock()
 
 	if !canStart {
@@ -452,7 +437,7 @@ func (rc *RecConn) connect(connected chan<- struct{}) {
 		rc.mu.Lock()
 		rc.Conn = wsConn
 		rc.dialErr = err
-		rc.isConnected = err == nil
+		rc.isConnecting = err == nil
 		rc.httpResp = httpResp
 		rc.mu.Unlock()
 
@@ -474,10 +459,10 @@ func (rc *RecConn) connect(connected chan<- struct{}) {
 				rc.keepAlive()
 			}
 
-			connected <- struct{}{}
 			rc.mu.Lock()
-			rc.isConnecting = false
+			rc.isConnectRunning = false
 			rc.mu.Unlock()
+
 			return
 		}
 
@@ -514,5 +499,5 @@ func (rc *RecConn) IsConnected() bool {
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
 
-	return rc.isConnected
+	return rc.isConnecting
 }
