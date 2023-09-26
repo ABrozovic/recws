@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"log"
-	"math/rand"
 	"net/http"
 	"net/url"
 	"sync"
@@ -47,13 +46,14 @@ type RecConn struct {
 	// NonVerbose suppress connecting/reconnecting messages.
 	NonVerbose bool
 
-	isConnected bool
-	mu          sync.RWMutex
-	url         string
-	reqHeader   http.Header
-	httpResp    *http.Response
-	dialErr     error
-	dialer      *websocket.Dialer
+	isConnected  bool
+	isConnecting bool
+	mu           sync.RWMutex
+	url          string
+	reqHeader    http.Header
+	httpResp     *http.Response
+	dialErr      error
+	dialer       *websocket.Dialer
 
 	*websocket.Conn
 }
@@ -61,7 +61,9 @@ type RecConn struct {
 // CloseAndReconnect will try to reconnect.
 func (rc *RecConn) CloseAndReconnect() {
 	rc.Close()
-	go rc.connect()
+	connected := make(chan<- struct{})
+	defer close(connected)
+	go rc.connect(connected)
 }
 
 // setIsConnected sets state for isConnected
@@ -329,10 +331,24 @@ func (rc *RecConn) Dial(urlStr string, reqHeader http.Header) {
 	rc.setDefaultDialer(rc.getTLSClientConfig(), rc.getHandshakeTimeout())
 
 	// Connect
-	go rc.connect()
+	connected := make(chan struct{})
+	go rc.connect(connected)
+	defer close(connected)
 
-	// wait on first attempt
-	time.Sleep(rc.getHandshakeTimeout())
+	// wait for first attempt, but only up to a point
+	timer := time.NewTimer(rc.getHandshakeTimeout())
+	defer timer.Stop()
+
+	// no default case means this select will block until one of these conditions is met.
+	// this is still guaranteed to complete, since the fallback here is the timer
+	select {
+	// in this case, the dial error is deferred until rc.GetDialError()
+	case <-timer.C:
+		return
+	case <-connected:
+		return
+	}
+
 }
 
 // GetURL returns current connection url
@@ -417,9 +433,17 @@ func (rc *RecConn) keepAlive() {
 	}()
 }
 
-func (rc *RecConn) connect() {
+func (rc *RecConn) connect(connected chan<- struct{}) {
+	rc.mu.Lock()
+	canStart := !rc.isConnecting
+	rc.isConnecting = true
+	rc.mu.Unlock()
+
+	if !canStart {
+		return
+	}
+
 	b := rc.getBackoff()
-	rand.Seed(time.Now().UTC().UnixNano())
 
 	for {
 		nextItvl := b.Duration()
@@ -450,6 +474,10 @@ func (rc *RecConn) connect() {
 				rc.keepAlive()
 			}
 
+			connected <- struct{}{}
+			rc.mu.Lock()
+			rc.isConnecting = false
+			rc.mu.Unlock()
 			return
 		}
 
